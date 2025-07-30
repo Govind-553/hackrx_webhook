@@ -1,0 +1,4 @@
+Flask
+PyMuPDF==1.22.0       # For reading PDFs
+requests
+python-dotenv
