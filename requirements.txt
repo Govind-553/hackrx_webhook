@@ -12,3 +12,4 @@ aiodns
 uvicorn
 faiss-cpu
 numpy
+asgiref

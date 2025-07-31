@@ -11,7 +11,7 @@ import faiss
 
 from sentence_transformers import SentenceTransformer
 import torch
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer
 
 # --- Model & System Configuration ---
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 
 try:
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
-    answer_generator = pipeline("summarization", model="facebook/bart-large-cnn", device=0 if DEVICE == 'cuda' else -1)
+    
+    # We need the tokenizer to correctly truncate the context
+    model_name = "facebook/bart-large-cnn"
+    answer_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    answer_generator = pipeline("summarization", model=model_name, tokenizer=answer_tokenizer, device=0 if DEVICE == 'cuda' else -1)
+    
     logger.info(f"Models loaded successfully on {DEVICE.upper()}.")
 except Exception as e:
     logger.error(f"Fatal error loading models: {e}")
@@ -48,23 +53,33 @@ def build_faiss_index(text_chunks: list[str]):
     return index
 
 def search_and_generate(index, text_chunks, questions):
-    """Searches the index and generates answers using a generative model."""
+    """Searches the index and generates answers, ensuring context fits the model's limit."""
     if not index:
         return ["Document content could not be processed for search."] * len(questions)
 
     question_embeddings = embedding_model.encode(questions, convert_to_numpy=True)
     faiss.normalize_L2(question_embeddings)
     
-    distances, indices = index.search(question_embeddings, k=3)
+    distances, indices = index.search(question_embeddings, k=3) # Retrieve top 3 chunks
     answers = []
+    
+    # Define the max token length for the context based on the model's limit
+    max_context_tokens = answer_generator.model.config.max_position_embeddings - 200
 
     for i, question in enumerate(questions):
-        if distances[i][0] < 0.3:
+        if distances[i][0] < 0.3: # Confidence check
             answers.append("I could not find a relevant answer in the provided document.")
             continue
 
         context = " ".join([text_chunks[idx] for idx in indices[i] if idx != -1])
-        prompt = f'Based on the context: "{context}", answer the question: "{question}"'
+
+        # --- THE CRITICAL FIX ---
+        # Truncate the context to ensure it fits within the model's token limit.
+        tokenized_context = answer_tokenizer.encode(context, truncation=True, max_length=max_context_tokens)
+        truncated_context = answer_tokenizer.decode(tokenized_context, skip_special_tokens=True)
+        # --- END OF FIX ---
+
+        prompt = f'Based on the context: "{truncated_context}", answer the question: "{question}"'
         
         try:
             generated = answer_generator(prompt, max_length=120, min_length=10, do_sample=False)

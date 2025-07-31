@@ -1,8 +1,13 @@
 import uvicorn
 from app import create_app
+from asgiref.wsgi import WsgiToAsgi
 
-app = create_app()
+# Create the standard Flask app instance
+flask_app = create_app()
+
+# This allows the ASGI server (Uvicorn) to communicate correctly with the WSGI app (Flask)
+asgi_app = WsgiToAsgi(flask_app)
 
 if __name__ == '__main__':
-    # Uvicorn to run the app for high-performance async operations
-    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
+    # Run the wrapped ASGI app with Uvicorn
+    uvicorn.run(asgi_app, host="0.0.0.0", port=5000, log_level="info")
