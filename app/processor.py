@@ -2,6 +2,7 @@ import fitz  # PyMuPDF
 import requests
 from io import BytesIO
 from .utils import clean_text
+
 from sentence_transformers import SentenceTransformer, util
 import torch
 
@@ -22,6 +23,9 @@ def process_document_and_answer(pdf_url, questions):
         text = clean_text(text)
         page_sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 20]
         sentences.extend(page_sentences)
+
+    if not sentences:
+        raise Exception("The document has no readable or valid text content.")
 
     # Compute embeddings for all sentences in the document
     sentence_embeddings = model.encode(sentences, convert_to_tensor=True)
