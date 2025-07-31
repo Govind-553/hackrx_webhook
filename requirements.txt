@@ -1,8 +1,14 @@
 Flask
-PyMuPDF==1.22.0 # For PDF processing
+PyMuPDF==1.22.0
 requests
 python-dotenv
 sentence-transformers==2.2.2
 torch
 huggingface_hub==0.16.4
 transformers==4.30.2
+aiohttp
+cchardet
+aiodns
+uvicorn
+faiss-cpu
+numpy

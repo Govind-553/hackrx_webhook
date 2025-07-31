@@ -1,246 +1,113 @@
-import fitz  # PyMuPDF
-import requests
+import fitz
+import aiohttp
 from io import BytesIO
-from .utils import clean_text, chunk_text, calculate_relevance_score
+from .utils import clean_text, chunk_text
 import logging
-from functools import lru_cache
 import hashlib
-
-from sentence_transformers import SentenceTransformer, util
-import torch
+import asyncio
+import concurrent.futures
 import numpy as np
+import faiss
+
+from sentence_transformers import SentenceTransformer
+import torch
 from transformers import pipeline
-import re
 
-# Initialize models with optimized settings
-model = SentenceTransformer('all-MiniLM-L6-v2')
-model.max_seq_length = 512  # Optimize for speed
-
-# Initialize a more powerful model for complex questions
-backup_model = SentenceTransformer('paraphrase-mpnet-base-v2')
-
-# Question-answering pipeline for extractive QA
-qa_pipeline = pipeline("question-answering", 
-                      model="distilbert-base-cased-distilled-squad",
-                      tokenizer="distilbert-base-cased-distilled-squad")
-
-# Cache for document processing
-document_cache = {}
-embedding_cache = {}
-
-logging.basicConfig(level=logging.INFO)
+# --- Model & System Configuration ---
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 logger = logging.getLogger(__name__)
 
-@lru_cache(maxsize=100)
-def get_document_hash(pdf_url):
-    """Generate hash for PDF URL to enable caching"""
+try:
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
+    answer_generator = pipeline("summarization", model="facebook/bart-large-cnn", device=0 if DEVICE == 'cuda' else -1)
+    logger.info(f"Models loaded successfully on {DEVICE.upper()}.")
+except Exception as e:
+    logger.error(f"Fatal error loading models: {e}")
+    raise
+
+document_cache = {}
+executor = concurrent.futures.ThreadPoolExecutor()
+
+def get_document_hash(pdf_url: str) -> str:
     return hashlib.md5(pdf_url.encode()).hexdigest()
 
-def extract_text_optimized(doc):
-    """Optimized text extraction with better structure preservation"""
-    full_text = ""
-    paragraphs = []
+async def run_in_executor(func, *args):
+    return await asyncio.get_event_loop().run_in_executor(executor, func, *args)
+
+def build_faiss_index(text_chunks: list[str]):
+    """Builds a FAISS index from text chunks for fast similarity search."""
+    if not text_chunks:
+        return None
     
-    for page_num, page in enumerate(doc):
-        # Extract text with layout preservation
-        text = page.get_text("text")
+    embeddings = embedding_model.encode(text_chunks, convert_to_numpy=True, show_progress_bar=False)
+    faiss.normalize_L2(embeddings)
+    
+    index = faiss.IndexIDMap(faiss.IndexFlatIP(embeddings.shape[1]))
+    index.add_with_ids(embeddings, np.arange(len(text_chunks)))
+    
+    return index
+
+def search_and_generate(index, text_chunks, questions):
+    """Searches the index and generates answers using a generative model."""
+    if not index:
+        return ["Document content could not be processed for search."] * len(questions)
+
+    question_embeddings = embedding_model.encode(questions, convert_to_numpy=True)
+    faiss.normalize_L2(question_embeddings)
+    
+    distances, indices = index.search(question_embeddings, k=3)
+    answers = []
+
+    for i, question in enumerate(questions):
+        if distances[i][0] < 0.3:
+            answers.append("I could not find a relevant answer in the provided document.")
+            continue
+
+        context = " ".join([text_chunks[idx] for idx in indices[i] if idx != -1])
+        prompt = f'Based on the context: "{context}", answer the question: "{question}"'
         
-        # Extract tables separately if they exist
         try:
-            tables = page.find_tables()
-            for table in tables:
-                table_text = table.extract()
-                if table_text:
-                    formatted_table = "\n".join([" | ".join(row) for row in table_text])
-                    text += f"\n\nTable on page {page_num + 1}:\n{formatted_table}\n"
-        except:
-            pass  # Skip if table extraction fails
-        
-        full_text += f"\n--- Page {page_num + 1} ---\n{text}"
-        
-        # Split into paragraphs for better semantic chunking
-        page_paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 30]
-        paragraphs.extend(page_paragraphs)
-    
-    return full_text, paragraphs
+            generated = answer_generator(prompt, max_length=120, min_length=10, do_sample=False)
+            answers.append(generated[0]['summary_text'].strip())
+        except Exception as e:
+            logger.error(f"Error generating answer for question '{question}': {e}")
+            answers.append("An error occurred during answer generation.")
+            
+    return answers
 
-def preprocess_questions(questions):
-    """Analyze and categorize questions for optimal processing"""
-    processed_questions = []
-    
-    for question in questions:
-        q_lower = question.lower().strip()
-        
-        # Categorize question types
-        question_type = "general"
-        if any(word in q_lower for word in ["what", "define", "explain", "describe"]):
-            question_type = "definition"
-        elif any(word in q_lower for word in ["how many", "count", "number"]):
-            question_type = "numerical"
-        elif any(word in q_lower for word in ["when", "date", "time"]):
-            question_type = "temporal"
-        elif any(word in q_lower for word in ["where", "location"]):
-            question_type = "location"
-        elif any(word in q_lower for word in ["why", "reason", "because"]):
-            question_type = "causal"
-        elif any(word in q_lower for word in ["how", "process", "steps"]):
-            question_type = "procedural"
-        
-        processed_questions.append({
-            "original": question,
-            "processed": q_lower,
-            "type": question_type
-        })
-    
-    return processed_questions
+async def process_document_and_answer(pdf_url: str, questions: list[str]) -> list[str]:
+    """Main workflow: downloads, processes, and answers questions from a PDF."""
+    doc_hash = get_document_hash(pdf_url)
 
-def multi_level_search(question_data, text_chunks, embeddings):
-    """Multi-level search combining different techniques"""
-    question = question_data["original"]
-    q_type = question_data["type"]
-    
-    # Level 1: Semantic similarity search
-    question_embedding = model.encode(question, convert_to_tensor=True)
-    cosine_scores = util.cos_sim(question_embedding, embeddings)[0]
-    
-    # Get top 5 candidates instead of just 1
-    top_indices = torch.topk(cosine_scores, k=min(5, len(text_chunks))).indices.tolist()
-    
-    # Level 2: Keyword matching boost
-    question_keywords = set(re.findall(r'\b\w+\b', question.lower()))
-    
-    boosted_scores = []
-    for idx in top_indices:
-        chunk = text_chunks[idx]
-        chunk_keywords = set(re.findall(r'\b\w+\b', chunk.lower()))
-        
-        # Keyword overlap boost
-        keyword_overlap = len(question_keywords.intersection(chunk_keywords))
-        keyword_boost = keyword_overlap / max(len(question_keywords), 1)
-        
-        # Question type specific boost
-        type_boost = 0
-        if q_type == "numerical" and re.search(r'\d+', chunk):
-            type_boost = 0.1
-        elif q_type == "temporal" and re.search(r'\b(19|20)\d{2}\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', chunk.lower()):
-            type_boost = 0.1
-        
-        final_score = cosine_scores[idx].item() + (keyword_boost * 0.2) + type_boost
-        boosted_scores.append((idx, final_score, chunk))
-    
-    # Sort by boosted scores
-    boosted_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # Level 3: Extractive QA for top candidate
-    best_chunk = boosted_scores[0][2]
-    
-    try:
-        # Use extractive QA for more precise answers
-        qa_result = qa_pipeline(question=question, context=best_chunk)
-        
-        # If confidence is high, use the extracted answer
-        if qa_result['score'] > 0.3:
-            return qa_result['answer']
-        else:
-            # Fall back to best chunk
-            return best_chunk
-    except:
-        # If QA pipeline fails, return best chunk
-        return best_chunk
+    if doc_hash in document_cache:
+        logger.info(f"Using cached FAISS index for {pdf_url}")
+        index, text_chunks = document_cache[doc_hash]
+    else:
+        logger.info(f"Fetching and processing new document: {pdf_url}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(pdf_url, timeout=45) as response:
+                    response.raise_for_status()
+                    doc_bytes = await response.read()
+            
+            with fitz.open(stream=doc_bytes, filetype="pdf") as doc:
+                raw_text = " ".join(page.get_text() for page in doc)
+            
+            if not raw_text.strip():
+                raise ValueError("The document is empty or contains no readable text.")
 
-def process_document_and_answer(pdf_url, questions):
-    """Enhanced document processing with multi-level optimization"""
-    try:
-        # Check cache first
-        doc_hash = get_document_hash(pdf_url)
-        
-        if doc_hash in document_cache:
-            logger.info("Using cached document")
-            text_chunks, embeddings = document_cache[doc_hash]
-        else:
-            logger.info("Processing new document")
-            # Fetch document with timeout
-            response = requests.get(pdf_url, timeout=30)
-            if response.status_code != 200:
-                raise Exception(f"Unable to fetch PDF document. Status code: {response.status_code}")
+            cleaned_text = await run_in_executor(clean_text, raw_text)
+            text_chunks = await run_in_executor(chunk_text, cleaned_text, 400, 50)
+            
+            index = await run_in_executor(build_faiss_index, text_chunks)
+            if not index:
+                raise ValueError("Failed to build a search index from the document content.")
 
-            # Open and process PDF
-            doc = fitz.open(stream=BytesIO(response.content), filetype="pdf")
-            
-            # Extract text with optimization
-            full_text, paragraphs = extract_text_optimized(doc)
-            doc.close()
-            
-            if not full_text.strip():
-                raise Exception("The document has no readable text content.")
-            
-            # Create optimized text chunks
-            text_chunks = []
-            
-            # Use paragraphs as primary chunks
-            for para in paragraphs:
-                cleaned_para = clean_text(para)
-                if len(cleaned_para) > 50:  # Minimum chunk size
-                    text_chunks.append(cleaned_para)
-            
-            # Add sentence-level chunks for better granularity
-            sentences = chunk_text(full_text, chunk_size=200, overlap=50)
-            text_chunks.extend(sentences)
-            
-            # Remove duplicates and very short chunks
-            text_chunks = list(set([chunk for chunk in text_chunks if len(chunk.strip()) > 30]))
-            
-            if not text_chunks:
-                raise Exception("No valid text chunks could be extracted from the document.")
-            
-            # Compute embeddings with batch processing
-            logger.info(f"Computing embeddings for {len(text_chunks)} chunks")
-            embeddings = model.encode(text_chunks, convert_to_tensor=True, batch_size=32, show_progress_bar=True)
-            
-            # Cache the results
-            document_cache[doc_hash] = (text_chunks, embeddings)
-            
-            # Limit cache size
+            document_cache[doc_hash] = (index, text_chunks)
             if len(document_cache) > 10:
-                oldest_key = next(iter(document_cache))
-                del document_cache[oldest_key]
-        
-        # Process questions with optimization
-        processed_questions = preprocess_questions(questions)
-        
-        answers = []
-        for question_data in processed_questions:
-            logger.info(f"Processing question: {question_data['original']}")
-            
-            # Multi-level search for best answer
-            answer = multi_level_search(question_data, text_chunks, embeddings)
-            
-            # Post-process answer
-            if len(answer) > 500:
-                # Truncate very long answers intelligently
-                sentences = answer.split('.')
-                truncated = '.'.join(sentences[:3])
-                if len(truncated) < 200 and len(sentences) > 3:
-                    truncated = '.'.join(sentences[:5])
-                answer = truncated + '.' if not truncated.endswith('.') else truncated
-            
-            answers.append(answer.strip())
-        
-        logger.info(f"Successfully processed {len(questions)} questions")
-        return answers
-        
-    except requests.RequestException as e:
-        logger.error(f"Network error: {str(e)}")
-        raise Exception(f"Network error while fetching document: {str(e)}")
-    except Exception as e:
-        logger.error(f"Processing error: {str(e)}")
-        raise Exception(f"Document processing error: {str(e)}")
+                del document_cache[next(iter(document_cache))]
+        except Exception as e:
+            logger.error(f"Failed to process document from {pdf_url}: {e}")
+            raise RuntimeError(f"Document processing error: {e}") from e
 
-def health_check():
-    """Health check function for monitoring"""
-    try:
-        # Test model loading
-        test_embedding = model.encode("test", convert_to_tensor=True)
-        return True
-    except:
-        return False
+    return await run_in_executor(search_and_generate, index, text_chunks, questions)
